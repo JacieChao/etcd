@@ -29,8 +29,10 @@ import (
 	"github.com/coreos/etcd/pkg/flags"
 	"github.com/coreos/etcd/pkg/srv"
 	"github.com/coreos/etcd/pkg/transport"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/grpclog"
 )
 
@@ -101,8 +103,19 @@ type clientConfig struct {
 	acfg             *authCfg
 }
 
+type discardValue struct{}
+
+func (*discardValue) String() string   { return "" }
+func (*discardValue) Set(string) error { return nil }
+func (*discardValue) Type() string     { return "" }
+
 func clientConfigFromCmd(cmd *cobra.Command) *clientConfig {
 	fs := cmd.InheritedFlags()
+
+	// silence "pkg/flags: unrecognized environment variable ETCDCTL_WATCH_KEY=foo" warnings
+	// silence "pkg/flags: unrecognized environment variable ETCDCTL_WATCH_RANGE_END=bar" warnings
+	fs.AddFlag(&pflag.Flag{Name: "watch-key", Value: &discardValue{}})
+	fs.AddFlag(&pflag.Flag{Name: "watch-range-end", Value: &discardValue{}})
 	flags.SetPflagsFromEnv("ETCDCTL", fs)
 
 	debug, err := cmd.Flags().GetBool("debug")
@@ -114,6 +127,8 @@ func clientConfigFromCmd(cmd *cobra.Command) *clientConfig {
 		fs.VisitAll(func(f *pflag.Flag) {
 			fmt.Fprintf(os.Stderr, "%s=%v\n", flags.FlagToEnv("ETCDCTL", f.Name), f.Value)
 		})
+	} else {
+		clientv3.SetLogger(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
 	}
 
 	cfg := &clientConfig{}
@@ -130,6 +145,15 @@ func clientConfigFromCmd(cmd *cobra.Command) *clientConfig {
 	cfg.acfg = authCfgFromCmd(cmd)
 
 	initDisplayFromCmd(cmd)
+	return cfg
+}
+
+func mustClientCfgFromCmd(cmd *cobra.Command) *clientv3.Config {
+	cc := clientConfigFromCmd(cmd)
+	cfg, err := newClientCfg(cc.endpoints, cc.dialTimeout, cc.keepAliveTime, cc.keepAliveTimeout, cc.scfg, cc.acfg)
+	if err != nil {
+		ExitWithError(ExitBadArgs, err)
+	}
 	return cfg
 }
 
@@ -156,6 +180,7 @@ func newClientCfg(endpoints []string, dialTimeout, keepAliveTime, keepAliveTimeo
 	// set tls if any one tls option set
 	var cfgtls *transport.TLSInfo
 	tlsinfo := transport.TLSInfo{}
+	tlsinfo.Logger, _ = zap.NewProduction()
 	if scfg.cert != "" {
 		tlsinfo.CertFile = scfg.cert
 		cfgtls = &tlsinfo
@@ -167,7 +192,7 @@ func newClientCfg(endpoints []string, dialTimeout, keepAliveTime, keepAliveTimeo
 	}
 
 	if scfg.cacert != "" {
-		tlsinfo.CAFile = scfg.cacert
+		tlsinfo.TrustedCAFile = scfg.cacert
 		cfgtls = &tlsinfo
 	}
 

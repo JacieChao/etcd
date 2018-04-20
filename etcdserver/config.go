@@ -25,6 +25,8 @@ import (
 	"github.com/coreos/etcd/pkg/netutil"
 	"github.com/coreos/etcd/pkg/transport"
 	"github.com/coreos/etcd/pkg/types"
+
+	"go.uber.org/zap"
 )
 
 // ServerConfig holds the configuration of etcd as taken from the command line or discovery.
@@ -44,8 +46,14 @@ type ServerConfig struct {
 	InitialPeerURLsMap  types.URLsMap
 	InitialClusterToken string
 	NewCluster          bool
-	ForceNewCluster     bool
 	PeerTLSInfo         transport.TLSInfo
+
+	CORS map[string]struct{}
+
+	// HostWhitelist lists acceptable hostnames from client requests.
+	// If server is insecure (no TLS), server only accepts requests
+	// whose Host header value exists in this white list.
+	HostWhitelist map[string]struct{}
 
 	TickMs           uint
 	ElectionTicks    int
@@ -66,7 +74,23 @@ type ServerConfig struct {
 
 	AuthToken string
 
-	CorruptCheckTime time.Duration
+	// InitialCorruptCheck is true to check data corruption on boot
+	// before serving any peer/client traffic.
+	InitialCorruptCheck bool
+	CorruptCheckTime    time.Duration
+
+	// PreVote is true to enable Raft Pre-Vote.
+	PreVote bool
+
+	// Logger logs server-side operations.
+	// If not nil, it disables "capnslog" and uses the given logger.
+	Logger *zap.Logger
+	// LoggerConfig is server logger configuration for Raft logger.
+	LoggerConfig zap.Config
+
+	Debug bool
+
+	ForceNewCluster bool
 }
 
 // VerifyBootstrap sanity-checks the initial config for bootstrap case
@@ -119,7 +143,8 @@ func (c *ServerConfig) advertiseMatchesCluster() error {
 	sort.Strings(apurls)
 	ctx, cancel := context.WithTimeout(context.TODO(), 30*time.Second)
 	defer cancel()
-	if netutil.URLStringsEqual(ctx, apurls, urls.StringSlice()) {
+	ok, err := netutil.URLStringsEqual(ctx, apurls, urls.StringSlice())
+	if ok {
 		return nil
 	}
 
@@ -143,7 +168,7 @@ func (c *ServerConfig) advertiseMatchesCluster() error {
 		}
 		mstr := strings.Join(missing, ",")
 		apStr := strings.Join(apurls, ",")
-		return fmt.Errorf("--initial-cluster has %s but missing from --initial-advertise-peer-urls=%s ", mstr, apStr)
+		return fmt.Errorf("--initial-cluster has %s but missing from --initial-advertise-peer-urls=%s (%v)", mstr, apStr, err)
 	}
 
 	for url := range apMap {
@@ -151,9 +176,16 @@ func (c *ServerConfig) advertiseMatchesCluster() error {
 			missing = append(missing, url)
 		}
 	}
-	mstr := strings.Join(missing, ",")
+	if len(missing) > 0 {
+		mstr := strings.Join(missing, ",")
+		umap := types.URLsMap(map[string]types.URLs{c.Name: c.PeerURLs})
+		return fmt.Errorf("--initial-advertise-peer-urls has %s but missing from --initial-cluster=%s", mstr, umap.String())
+	}
+
+	// resolved URLs from "--initial-advertise-peer-urls" and "--initial-cluster" did not match or failed
+	apStr := strings.Join(apurls, ",")
 	umap := types.URLsMap(map[string]types.URLs{c.Name: c.PeerURLs})
-	return fmt.Errorf("--initial-advertise-peer-urls has %s but missing from --initial-cluster=%s", mstr, umap.String())
+	return fmt.Errorf("failed to resolve %s to match --initial-cluster=%s (%v)", apStr, umap.String(), err)
 }
 
 func (c *ServerConfig) MemberDir() string { return filepath.Join(c.DataDir, "member") }
@@ -190,28 +222,60 @@ func (c *ServerConfig) PrintWithInitial() { c.print(true) }
 func (c *ServerConfig) Print() { c.print(false) }
 
 func (c *ServerConfig) print(initial bool) {
-	plog.Infof("name = %s", c.Name)
-	if c.ForceNewCluster {
-		plog.Infof("force new cluster")
-	}
-	plog.Infof("data dir = %s", c.DataDir)
-	plog.Infof("member dir = %s", c.MemberDir())
-	if c.DedicatedWALDir != "" {
-		plog.Infof("dedicated WAL dir = %s", c.DedicatedWALDir)
-	}
-	plog.Infof("heartbeat = %dms", c.TickMs)
-	plog.Infof("election = %dms", c.ElectionTicks*int(c.TickMs))
-	plog.Infof("snapshot count = %d", c.SnapCount)
-	if len(c.DiscoveryURL) != 0 {
-		plog.Infof("discovery URL= %s", c.DiscoveryURL)
-		if len(c.DiscoveryProxy) != 0 {
-			plog.Infof("discovery proxy = %s", c.DiscoveryProxy)
+	// TODO: remove this after dropping "capnslog"
+	if c.Logger == nil {
+		plog.Infof("name = %s", c.Name)
+		if c.ForceNewCluster {
+			plog.Infof("force new cluster")
 		}
-	}
-	plog.Infof("advertise client URLs = %s", c.ClientURLs)
-	if initial {
-		plog.Infof("initial advertise peer URLs = %s", c.PeerURLs)
-		plog.Infof("initial cluster = %s", c.InitialPeerURLsMap)
+		plog.Infof("data dir = %s", c.DataDir)
+		plog.Infof("member dir = %s", c.MemberDir())
+		if c.DedicatedWALDir != "" {
+			plog.Infof("dedicated WAL dir = %s", c.DedicatedWALDir)
+		}
+		plog.Infof("heartbeat = %dms", c.TickMs)
+		plog.Infof("election = %dms", c.ElectionTicks*int(c.TickMs))
+		plog.Infof("snapshot count = %d", c.SnapCount)
+		if len(c.DiscoveryURL) != 0 {
+			plog.Infof("discovery URL= %s", c.DiscoveryURL)
+			if len(c.DiscoveryProxy) != 0 {
+				plog.Infof("discovery proxy = %s", c.DiscoveryProxy)
+			}
+		}
+		plog.Infof("advertise client URLs = %s", c.ClientURLs)
+		if initial {
+			plog.Infof("initial advertise peer URLs = %s", c.PeerURLs)
+			plog.Infof("initial cluster = %s", c.InitialPeerURLsMap)
+		}
+	} else {
+		state := "new"
+		if !c.NewCluster {
+			state = "existing"
+		}
+		c.Logger.Info(
+			"server configuration",
+			zap.String("name", c.Name),
+			zap.String("data-dir", c.DataDir),
+			zap.String("member-dir", c.MemberDir()),
+			zap.String("dedicated-wal-dir", c.DedicatedWALDir),
+			zap.Bool("force-new-cluster", c.ForceNewCluster),
+			zap.Uint("heartbeat-tick-ms", c.TickMs),
+			zap.String("heartbeat-interval", fmt.Sprintf("%v", time.Duration(c.TickMs)*time.Millisecond)),
+			zap.Int("election-tick-ms", c.ElectionTicks),
+			zap.String("election-timeout", fmt.Sprintf("%v", time.Duration(c.ElectionTicks*int(c.TickMs))*time.Millisecond)),
+			zap.Uint64("snapshot-count", c.SnapCount),
+			zap.Strings("advertise-client-urls", c.getACURLs()),
+			zap.Strings("initial-advertise-peer-urls", c.getAPURLs()),
+			zap.Bool("initial", initial),
+			zap.String("initial-cluster", c.InitialPeerURLsMap.String()),
+			zap.String("initial-cluster-state", state),
+			zap.String("initial-cluster-token", c.InitialClusterToken),
+			zap.Bool("pre-vote", c.PreVote),
+			zap.Bool("initial-corrupt-check", c.InitialCorruptCheck),
+			zap.Duration("corrupt-check-time", c.CorruptCheckTime),
+			zap.String("discovery-url", c.DiscoveryURL),
+			zap.String("discovery-proxy", c.DiscoveryProxy),
+		)
 	}
 }
 
@@ -237,3 +301,19 @@ func (c *ServerConfig) bootstrapTimeout() time.Duration {
 }
 
 func (c *ServerConfig) backendPath() string { return filepath.Join(c.SnapDir(), "db") }
+
+func (c *ServerConfig) getAPURLs() (ss []string) {
+	ss = make([]string, len(c.PeerURLs))
+	for i := range c.PeerURLs {
+		ss[i] = c.PeerURLs[i].String()
+	}
+	return ss
+}
+
+func (c *ServerConfig) getACURLs() (ss []string) {
+	ss = make([]string, len(c.ClientURLs))
+	for i := range c.ClientURLs {
+		ss[i] = c.ClientURLs[i].String()
+	}
+	return ss
+}

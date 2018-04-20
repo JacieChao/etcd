@@ -29,8 +29,10 @@ import (
 	"github.com/coreos/etcd/pkg/pbutil"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/snap"
+	"github.com/coreos/etcd/raftsnap"
 	"github.com/coreos/etcd/version"
+
+	"go.uber.org/zap"
 )
 
 func TestServeRaftPrefix(t *testing.T) {
@@ -151,7 +153,7 @@ func TestServeRaftPrefix(t *testing.T) {
 		req.Header.Set("X-Etcd-Cluster-ID", tt.clusterID)
 		req.Header.Set("X-Server-Version", version.Version)
 		rw := httptest.NewRecorder()
-		h := newPipelineHandler(NewNopTransporter(), tt.p, types.ID(0))
+		h := newPipelineHandler(&Transport{Logger: zap.NewExample()}, tt.p, types.ID(0))
 
 		// goroutine because the handler panics to disconnect on raft error
 		donec := make(chan struct{})
@@ -356,7 +358,7 @@ func (pg *fakePeerGetter) Get(id types.ID) Peer { return pg.peers[id] }
 
 type fakePeer struct {
 	msgs     []raftpb.Message
-	snapMsgs []snap.Message
+	snapMsgs []raftsnap.Message
 	peerURLs types.URLs
 	connc    chan *outgoingConn
 	paused   bool
@@ -377,7 +379,7 @@ func (pr *fakePeer) send(m raftpb.Message) {
 	pr.msgs = append(pr.msgs, m)
 }
 
-func (pr *fakePeer) sendSnap(m snap.Message) {
+func (pr *fakePeer) sendSnap(m raftsnap.Message) {
 	if pr.paused {
 		return
 	}

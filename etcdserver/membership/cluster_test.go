@@ -21,11 +21,13 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/coreos/etcd/etcdserver/v2store"
 	"github.com/coreos/etcd/pkg/mock/mockstore"
 	"github.com/coreos/etcd/pkg/testutil"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/store"
+
+	"go.uber.org/zap"
 )
 
 func TestClusterMember(t *testing.T) {
@@ -274,8 +276,8 @@ func TestClusterValidateAndAssignIDs(t *testing.T) {
 }
 
 func TestClusterValidateConfigurationChange(t *testing.T) {
-	cl := NewCluster("")
-	cl.SetStore(store.New())
+	cl := NewCluster(zap.NewExample(), "")
+	cl.SetStore(v2store.New())
 	for i := 1; i <= 4; i++ {
 		attr := RaftAttributes{PeerURLs: []string{fmt.Sprintf("http://127.0.0.1:%d", i)}}
 		cl.AddMember(&Member{ID: types.ID(i), RaftAttributes: attr})
@@ -416,25 +418,25 @@ func TestClusterGenID(t *testing.T) {
 }
 
 func TestNodeToMemberBad(t *testing.T) {
-	tests := []*store.NodeExtern{
-		{Key: "/1234", Nodes: []*store.NodeExtern{
+	tests := []*v2store.NodeExtern{
+		{Key: "/1234", Nodes: []*v2store.NodeExtern{
 			{Key: "/1234/strange"},
 		}},
-		{Key: "/1234", Nodes: []*store.NodeExtern{
+		{Key: "/1234", Nodes: []*v2store.NodeExtern{
 			{Key: "/1234/raftAttributes", Value: stringp("garbage")},
 		}},
-		{Key: "/1234", Nodes: []*store.NodeExtern{
+		{Key: "/1234", Nodes: []*v2store.NodeExtern{
 			{Key: "/1234/attributes", Value: stringp(`{"name":"node1","clientURLs":null}`)},
 		}},
-		{Key: "/1234", Nodes: []*store.NodeExtern{
+		{Key: "/1234", Nodes: []*v2store.NodeExtern{
 			{Key: "/1234/raftAttributes", Value: stringp(`{"peerURLs":null}`)},
 			{Key: "/1234/strange"},
 		}},
-		{Key: "/1234", Nodes: []*store.NodeExtern{
+		{Key: "/1234", Nodes: []*v2store.NodeExtern{
 			{Key: "/1234/raftAttributes", Value: stringp(`{"peerURLs":null}`)},
 			{Key: "/1234/attributes", Value: stringp("garbage")},
 		}},
-		{Key: "/1234", Nodes: []*store.NodeExtern{
+		{Key: "/1234", Nodes: []*v2store.NodeExtern{
 			{Key: "/1234/raftAttributes", Value: stringp(`{"peerURLs":null}`)},
 			{Key: "/1234/attributes", Value: stringp(`{"name":"node1","clientURLs":null}`)},
 			{Key: "/1234/strange"},
@@ -461,7 +463,7 @@ func TestClusterAddMember(t *testing.T) {
 				false,
 				`{"peerURLs":null}`,
 				false,
-				store.TTLOptionSet{ExpireTime: store.Permanent},
+				v2store.TTLOptionSet{ExpireTime: v2store.Permanent},
 			},
 		},
 	}
@@ -500,7 +502,7 @@ func TestClusterRemoveMember(t *testing.T) {
 
 	wactions := []testutil.Action{
 		{Name: "Delete", Params: []interface{}{MemberStoreKey(1), true, true}},
-		{Name: "Create", Params: []interface{}{RemovedMemberStoreKey(1), false, "", false, store.TTLOptionSet{ExpireTime: store.Permanent}}},
+		{Name: "Create", Params: []interface{}{RemovedMemberStoreKey(1), false, "", false, v2store.TTLOptionSet{ExpireTime: v2store.Permanent}}},
 	}
 	if !reflect.DeepEqual(st.Action(), wactions) {
 		t.Errorf("actions = %v, want %v", st.Action(), wactions)
@@ -544,7 +546,7 @@ func TestClusterUpdateAttributes(t *testing.T) {
 }
 
 func TestNodeToMember(t *testing.T) {
-	n := &store.NodeExtern{Key: "/1234", Nodes: []*store.NodeExtern{
+	n := &v2store.NodeExtern{Key: "/1234", Nodes: []*v2store.NodeExtern{
 		{Key: "/1234/attributes", Value: stringp(`{"name":"node1","clientURLs":null}`)},
 		{Key: "/1234/raftAttributes", Value: stringp(`{"peerURLs":null}`)},
 	}}
@@ -559,7 +561,7 @@ func TestNodeToMember(t *testing.T) {
 }
 
 func newTestCluster(membs []*Member) *RaftCluster {
-	c := &RaftCluster{members: make(map[types.ID]*Member), removed: make(map[types.ID]bool)}
+	c := &RaftCluster{lg: zap.NewExample(), members: make(map[types.ID]*Member), removed: make(map[types.ID]bool)}
 	for _, m := range membs {
 		c.members[m.ID] = m
 	}

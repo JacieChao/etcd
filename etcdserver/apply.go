@@ -17,14 +17,17 @@ package etcdserver
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
+	"github.com/coreos/etcd/auth"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/lease"
 	"github.com/coreos/etcd/mvcc"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 	"github.com/coreos/etcd/pkg/types"
+	"go.uber.org/zap"
 
 	"github.com/gogo/protobuf/proto"
 )
@@ -106,6 +109,8 @@ func (s *EtcdServer) newApplierV3() applierV3 {
 }
 
 func (a *applierV3backend) Apply(r *pb.InternalRaftRequest) *applyResult {
+	defer warnOfExpensiveRequest(a.s.getLogger(), time.Now(), r)
+
 	ar := &applyResult{}
 
 	// call into a.s.applyV3.F instead of a.F so upper appliers can check individual calls
@@ -224,8 +229,9 @@ func (a *applierV3backend) DeleteRange(txn mvcc.TxnWrite, dr *pb.DeleteRangeRequ
 			return nil, err
 		}
 		if rr != nil {
+			resp.PrevKvs = make([]*mvccpb.KeyValue, len(rr.KVs))
 			for i := range rr.KVs {
-				resp.PrevKvs = append(resp.PrevKvs, &rr.KVs[i])
+				resp.PrevKvs[i] = &rr.KVs[i]
 			}
 		}
 	}
@@ -319,11 +325,12 @@ func (a *applierV3backend) Range(txn mvcc.TxnRead, r *pb.RangeRequest) (*pb.Rang
 
 	resp.Header.Revision = rr.Rev
 	resp.Count = int64(rr.Count)
+	resp.Kvs = make([]*mvccpb.KeyValue, len(rr.KVs))
 	for i := range rr.KVs {
 		if r.KeysOnly {
 			rr.KVs[i].Value = nil
 		}
-		resp.Kvs = append(resp.Kvs, &rr.KVs[i])
+		resp.Kvs[i] = &rr.KVs[i]
 	}
 	return resp, nil
 }
@@ -498,25 +505,39 @@ func (a *applierV3backend) applyTxn(txn mvcc.TxnWrite, rt *pb.TxnRequest, txnPat
 	if !txnPath[0] {
 		reqs = rt.Failure
 	}
+
+	lg := a.s.getLogger()
 	for i, req := range reqs {
 		respi := tresp.Responses[i].Response
 		switch tv := req.Request.(type) {
 		case *pb.RequestOp_RequestRange:
 			resp, err := a.Range(txn, tv.RequestRange)
 			if err != nil {
-				plog.Panicf("unexpected error during txn: %v", err)
+				if lg != nil {
+					lg.Panic("unexpected error during txn", zap.Error(err))
+				} else {
+					plog.Panicf("unexpected error during txn: %v", err)
+				}
 			}
 			respi.(*pb.ResponseOp_ResponseRange).ResponseRange = resp
 		case *pb.RequestOp_RequestPut:
 			resp, err := a.Put(txn, tv.RequestPut)
 			if err != nil {
-				plog.Panicf("unexpected error during txn: %v", err)
+				if lg != nil {
+					lg.Panic("unexpected error during txn", zap.Error(err))
+				} else {
+					plog.Panicf("unexpected error during txn: %v", err)
+				}
 			}
 			respi.(*pb.ResponseOp_ResponsePut).ResponsePut = resp
 		case *pb.RequestOp_RequestDeleteRange:
 			resp, err := a.DeleteRange(txn, tv.RequestDeleteRange)
 			if err != nil {
-				plog.Panicf("unexpected error during txn: %v", err)
+				if lg != nil {
+					lg.Panic("unexpected error during txn", zap.Error(err))
+				} else {
+					plog.Panicf("unexpected error during txn: %v", err)
+				}
 			}
 			respi.(*pb.ResponseOp_ResponseDeleteRange).ResponseDeleteRange = resp
 		case *pb.RequestOp_RequestTxn:
@@ -564,6 +585,7 @@ func (a *applierV3backend) Alarm(ar *pb.AlarmRequest) (*pb.AlarmResponse, error)
 	resp := &pb.AlarmResponse{}
 	oldCount := len(a.s.alarmStore.Get(ar.Alarm))
 
+	lg := a.s.getLogger()
 	switch ar.Action {
 	case pb.AlarmRequest_GET:
 		resp.Alarms = a.s.alarmStore.Get(ar.Alarm)
@@ -578,14 +600,22 @@ func (a *applierV3backend) Alarm(ar *pb.AlarmRequest) (*pb.AlarmResponse, error)
 			break
 		}
 
-		plog.Warningf("alarm %v raised by peer %s", m.Alarm, types.ID(m.MemberID))
+		if lg != nil {
+			lg.Warn("alarm raised", zap.String("alarm", m.Alarm.String()), zap.String("from", types.ID(m.MemberID).String()))
+		} else {
+			plog.Warningf("alarm %v raised by peer %s", m.Alarm, types.ID(m.MemberID))
+		}
 		switch m.Alarm {
 		case pb.AlarmType_CORRUPT:
 			a.s.applyV3 = newApplierV3Corrupt(a)
 		case pb.AlarmType_NOSPACE:
 			a.s.applyV3 = newApplierV3Capped(a)
 		default:
-			plog.Errorf("unimplemented alarm activation (%+v)", m)
+			if lg != nil {
+				lg.Warn("unimplemented alarm activation", zap.String("alarm", fmt.Sprintf("%+v", m)))
+			} else {
+				plog.Errorf("unimplemented alarm activation (%+v)", m)
+			}
 		}
 	case pb.AlarmRequest_DEACTIVATE:
 		m := a.s.alarmStore.Deactivate(types.ID(ar.MemberID), ar.Alarm)
@@ -601,10 +631,18 @@ func (a *applierV3backend) Alarm(ar *pb.AlarmRequest) (*pb.AlarmResponse, error)
 		switch m.Alarm {
 		case pb.AlarmType_NOSPACE, pb.AlarmType_CORRUPT:
 			// TODO: check kv hash before deactivating CORRUPT?
-			plog.Infof("alarm disarmed %+v", ar)
+			if lg != nil {
+				lg.Warn("alarm disarmed", zap.String("alarm", m.Alarm.String()), zap.String("from", types.ID(m.MemberID).String()))
+			} else {
+				plog.Infof("alarm disarmed %+v", ar)
+			}
 			a.s.applyV3 = a.s.newApplierV3()
 		default:
-			plog.Errorf("unimplemented alarm deactivation (%+v)", m)
+			if lg != nil {
+				lg.Warn("unimplemented alarm deactivation", zap.String("alarm", fmt.Sprintf("%+v", m)))
+			} else {
+				plog.Errorf("unimplemented alarm deactivation (%+v)", m)
+			}
 		}
 	default:
 		return nil, nil
@@ -650,7 +688,7 @@ func (a *applierV3backend) AuthDisable() (*pb.AuthDisableResponse, error) {
 }
 
 func (a *applierV3backend) Authenticate(r *pb.InternalAuthenticateRequest) (*pb.AuthenticateResponse, error) {
-	ctx := context.WithValue(context.WithValue(a.s.ctx, "index", a.s.consistIndex.ConsistentIndex()), "simpleToken", r.SimpleToken)
+	ctx := context.WithValue(context.WithValue(a.s.ctx, auth.AuthenticateParamIndex{}, a.s.consistIndex.ConsistentIndex()), auth.AuthenticateParamSimpleTokenPrefix{}, r.SimpleToken)
 	resp, err := a.s.AuthStore().Authenticate(ctx, r.Name, r.Password)
 	if resp != nil {
 		resp.Header = newHeader(a.s)
@@ -768,7 +806,7 @@ type quotaApplierV3 struct {
 }
 
 func newQuotaApplierV3(s *EtcdServer, app applierV3) applierV3 {
-	return &quotaApplierV3{app, NewBackendQuota(s)}
+	return &quotaApplierV3{app, NewBackendQuota(s, "v3-applier")}
 }
 
 func (a *quotaApplierV3) Put(txn mvcc.TxnWrite, p *pb.PutRequest) (*pb.PutResponse, error) {

@@ -28,7 +28,9 @@ import (
 	"github.com/coreos/etcd/mvcc/backend"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 	"github.com/coreos/etcd/pkg/schedule"
+
 	"github.com/coreos/pkg/capnslog"
+	"go.uber.org/zap"
 )
 
 var (
@@ -99,15 +101,17 @@ type store struct {
 	fifoSched schedule.Scheduler
 
 	stopc chan struct{}
+
+	lg *zap.Logger
 }
 
 // NewStore returns a new store. It is useful to create a store inside
 // mvcc pkg. It should only be used for testing externally.
-func NewStore(b backend.Backend, le lease.Lessor, ig ConsistentIndexGetter) *store {
+func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ig ConsistentIndexGetter) *store {
 	s := &store{
 		b:       b,
 		ig:      ig,
-		kvindex: newTreeIndex(),
+		kvindex: newTreeIndex(lg),
 
 		le: le,
 
@@ -118,6 +122,8 @@ func NewStore(b backend.Backend, le lease.Lessor, ig ConsistentIndexGetter) *sto
 		fifoSched: schedule.NewFIFOScheduler(),
 
 		stopc: make(chan struct{}),
+
+		lg: lg,
 	}
 	s.ReadView = &readView{s}
 	s.WriteView = &writeView{s}
@@ -175,16 +181,15 @@ func (s *store) HashByRev(rev int64) (hash uint32, currentRev int64, compactRev 
 		return 0, currentRev, 0, ErrFutureRev
 	}
 
+	if rev == 0 {
+		rev = currentRev
+	}
 	keep := s.kvindex.Keep(rev)
 
 	tx := s.b.ReadTx()
 	tx.Lock()
 	defer tx.Unlock()
 	s.mu.RUnlock()
-
-	if rev == 0 {
-		rev = currentRev
-	}
 
 	upper := revision{main: rev + 1}
 	lower := revision{main: compactRev + 1}
@@ -212,17 +217,18 @@ func (s *store) HashByRev(rev int64) (hash uint32, currentRev int64, compactRev 
 
 func (s *store) Compact(rev int64) (<-chan struct{}, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.revMu.Lock()
-	defer s.revMu.Unlock()
-
 	if rev <= s.compactMainRev {
 		ch := make(chan struct{})
 		f := func(ctx context.Context) { s.compactBarrier(ctx, ch) }
 		s.fifoSched.Schedule(f)
+		s.mu.Unlock()
+		s.revMu.Unlock()
 		return ch, ErrCompacted
 	}
 	if rev > s.currentRev {
+		s.mu.Unlock()
+		s.revMu.Unlock()
 		return nil, ErrFutureRev
 	}
 
@@ -240,6 +246,8 @@ func (s *store) Compact(rev int64) (<-chan struct{}, error) {
 	// ensure that desired compaction is persisted
 	s.b.ForceCommit()
 
+	s.mu.Unlock()
+	s.revMu.Unlock()
 	keep := s.kvindex.Compact(rev)
 	ch := make(chan struct{})
 	var j = func(ctx context.Context) {
@@ -291,7 +299,7 @@ func (s *store) Restore(b backend.Backend) error {
 
 	atomic.StoreUint64(&s.consistentIndex, 0)
 	s.b = b
-	s.kvindex = newTreeIndex()
+	s.kvindex = newTreeIndex(s.lg)
 	s.currentRev = 1
 	s.compactMainRev = -1
 	s.fifoSched = schedule.NewFIFOScheduler()
@@ -301,10 +309,13 @@ func (s *store) Restore(b backend.Backend) error {
 }
 
 func (s *store) restore() error {
-	reportDbTotalSizeInBytesMu.Lock()
 	b := s.b
+	reportDbTotalSizeInBytesMu.Lock()
 	reportDbTotalSizeInBytes = func() float64 { return float64(b.Size()) }
 	reportDbTotalSizeInBytesMu.Unlock()
+	reportDbTotalSizeInUseInBytesMu.Lock()
+	reportDbTotalSizeInUseInBytes = func() float64 { return float64(b.SizeInUse()) }
+	reportDbTotalSizeInUseInBytesMu.Unlock()
 
 	min, max := newRevBytes(), newRevBytes()
 	revToBytes(revision{main: 1}, min)

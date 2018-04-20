@@ -26,10 +26,11 @@ import (
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/snap"
+	"github.com/coreos/etcd/raftsnap"
 
 	"github.com/coreos/pkg/capnslog"
 	"github.com/xiang90/probing"
+	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
 
@@ -60,7 +61,7 @@ type Transporter interface {
 	Send(m []raftpb.Message)
 	// SendSnapshot sends out the given snapshot message to a remote peer.
 	// The behavior of SendSnapshot is similar to Send.
-	SendSnapshot(m snap.Message)
+	SendSnapshot(m raftsnap.Message)
 	// AddRemote adds a remote with given peer urls into the transport.
 	// A remote helps newly joined member to catch up the progress of cluster,
 	// and will not be used after that.
@@ -85,6 +86,8 @@ type Transporter interface {
 	// If the connection is active since peer was added, it returns the adding time.
 	// If the connection is currently inactive, it returns zero time.
 	ActiveSince(id types.ID) time.Time
+	// ActivePeers returns the number of active peers.
+	ActivePeers() int
 	// Stop closes the connections and stops the transporter.
 	Stop()
 }
@@ -96,6 +99,8 @@ type Transporter interface {
 // User needs to call Start before calling other functions, and call
 // Stop when the Transport is no longer used.
 type Transport struct {
+	Logger *zap.Logger
+
 	DialTimeout time.Duration // maximum duration before timing out dial of the request
 	// DialRetryFrequency defines the frequency of streamReader dial retrial attempts;
 	// a distinct rate limiter is created per every peer (default value: 10 events/sec)
@@ -107,7 +112,7 @@ type Transport struct {
 	URLs        types.URLs // local peer URLs
 	ClusterID   types.ID   // raft cluster ID for request validation
 	Raft        Raft       // raft state machine, to which the Transport forwards received messages and reports status
-	Snapshotter *snap.Snapshotter
+	Snapshotter *raftsnap.Snapshotter
 	ServerStats *stats.ServerStats // used to record general transportation statistics
 	// used to record transportation statistics with followers when
 	// performing as leader in raft protocol
@@ -195,7 +200,15 @@ func (t *Transport) Send(msgs []raftpb.Message) {
 			continue
 		}
 
-		plog.Debugf("ignored message %s (sent to unknown peer %s)", m.Type, to)
+		if t.Logger != nil {
+			t.Logger.Debug(
+				"ignored message send request; unknown remote peer target",
+				zap.String("type", m.Type.String()),
+				zap.String("unknown-target-peer-id", to.String()),
+			)
+		} else {
+			plog.Debugf("ignored message %s (sent to unknown peer %s)", m.Type, to)
+		}
 	}
 }
 
@@ -266,9 +279,22 @@ func (t *Transport) AddRemote(id types.ID, us []string) {
 	}
 	urls, err := types.NewURLs(us)
 	if err != nil {
-		plog.Panicf("newURLs %+v should never fail: %+v", us, err)
+		if t.Logger != nil {
+			t.Logger.Panic("failed NewURLs", zap.Strings("urls", us), zap.Error(err))
+		} else {
+			plog.Panicf("newURLs %+v should never fail: %+v", us, err)
+		}
 	}
 	t.remotes[id] = startRemote(t, urls, id)
+
+	if t.Logger != nil {
+		t.Logger.Info(
+			"added new remote peer",
+			zap.String("local-member-id", t.ID.String()),
+			zap.String("remote-peer-id", id.String()),
+			zap.Strings("remote-peer-urls", us),
+		)
+	}
 }
 
 func (t *Transport) AddPeer(id types.ID, us []string) {
@@ -283,13 +309,26 @@ func (t *Transport) AddPeer(id types.ID, us []string) {
 	}
 	urls, err := types.NewURLs(us)
 	if err != nil {
-		plog.Panicf("newURLs %+v should never fail: %+v", us, err)
+		if t.Logger != nil {
+			t.Logger.Panic("failed NewURLs", zap.Strings("urls", us), zap.Error(err))
+		} else {
+			plog.Panicf("newURLs %+v should never fail: %+v", us, err)
+		}
 	}
 	fs := t.LeaderStats.Follower(id.String())
 	t.peers[id] = startPeer(t, urls, id, fs)
-	addPeerToProber(t.prober, id.String(), us)
+	addPeerToProber(t.Logger, t.prober, id.String(), us)
 
-	plog.Infof("added peer %s", id)
+	if t.Logger != nil {
+		t.Logger.Info(
+			"added remote peer",
+			zap.String("local-member-id", t.ID.String()),
+			zap.String("remote-peer-id", id.String()),
+			zap.Strings("remote-peer-urls", us),
+		)
+	} else {
+		plog.Infof("added peer %s", id)
+	}
 }
 
 func (t *Transport) RemovePeer(id types.ID) {
@@ -311,12 +350,25 @@ func (t *Transport) removePeer(id types.ID) {
 	if peer, ok := t.peers[id]; ok {
 		peer.stop()
 	} else {
-		plog.Panicf("unexpected removal of unknown peer '%d'", id)
+		if t.Logger != nil {
+			t.Logger.Panic("unexpected removal of unknown remote peer", zap.String("remote-peer-id", id.String()))
+		} else {
+			plog.Panicf("unexpected removal of unknown peer '%d'", id)
+		}
 	}
 	delete(t.peers, id)
 	delete(t.LeaderStats.Followers, id.String())
 	t.prober.Remove(id.String())
-	plog.Infof("removed peer %s", id)
+
+	if t.Logger != nil {
+		t.Logger.Info(
+			"removed remote peer",
+			zap.String("local-member-id", t.ID.String()),
+			zap.String("removed-remote-peer-id", id.String()),
+		)
+	} else {
+		plog.Infof("removed peer %s", id)
+	}
 }
 
 func (t *Transport) UpdatePeer(id types.ID, us []string) {
@@ -328,25 +380,39 @@ func (t *Transport) UpdatePeer(id types.ID, us []string) {
 	}
 	urls, err := types.NewURLs(us)
 	if err != nil {
-		plog.Panicf("newURLs %+v should never fail: %+v", us, err)
+		if t.Logger != nil {
+			t.Logger.Panic("failed NewURLs", zap.Strings("urls", us), zap.Error(err))
+		} else {
+			plog.Panicf("newURLs %+v should never fail: %+v", us, err)
+		}
 	}
 	t.peers[id].update(urls)
 
 	t.prober.Remove(id.String())
-	addPeerToProber(t.prober, id.String(), us)
-	plog.Infof("updated peer %s", id)
+	addPeerToProber(t.Logger, t.prober, id.String(), us)
+
+	if t.Logger != nil {
+		t.Logger.Info(
+			"updated remote peer",
+			zap.String("local-member-id", t.ID.String()),
+			zap.String("updated-remote-peer-id", id.String()),
+			zap.Strings("updated-remote-peer-urls", us),
+		)
+	} else {
+		plog.Infof("updated peer %s", id)
+	}
 }
 
 func (t *Transport) ActiveSince(id types.ID) time.Time {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if p, ok := t.peers[id]; ok {
 		return p.activeSince()
 	}
 	return time.Time{}
 }
 
-func (t *Transport) SendSnapshot(m snap.Message) {
+func (t *Transport) SendSnapshot(m raftsnap.Message) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	p := t.peers[types.ID(m.To)]
@@ -375,6 +441,20 @@ func (t *Transport) Resume() {
 	}
 }
 
+// ActivePeers returns a channel that closes when an initial
+// peer connection has been established. Use this to wait until the
+// first peer connection becomes active.
+func (t *Transport) ActivePeers() (cnt int) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, p := range t.peers {
+		if !p.activeSince().IsZero() {
+			cnt++
+		}
+	}
+	return cnt
+}
+
 type nopTransporter struct{}
 
 func NewNopTransporter() Transporter {
@@ -384,31 +464,32 @@ func NewNopTransporter() Transporter {
 func (s *nopTransporter) Start() error                        { return nil }
 func (s *nopTransporter) Handler() http.Handler               { return nil }
 func (s *nopTransporter) Send(m []raftpb.Message)             {}
-func (s *nopTransporter) SendSnapshot(m snap.Message)         {}
+func (s *nopTransporter) SendSnapshot(m raftsnap.Message)     {}
 func (s *nopTransporter) AddRemote(id types.ID, us []string)  {}
 func (s *nopTransporter) AddPeer(id types.ID, us []string)    {}
 func (s *nopTransporter) RemovePeer(id types.ID)              {}
 func (s *nopTransporter) RemoveAllPeers()                     {}
 func (s *nopTransporter) UpdatePeer(id types.ID, us []string) {}
 func (s *nopTransporter) ActiveSince(id types.ID) time.Time   { return time.Time{} }
+func (s *nopTransporter) ActivePeers() int                    { return 0 }
 func (s *nopTransporter) Stop()                               {}
 func (s *nopTransporter) Pause()                              {}
 func (s *nopTransporter) Resume()                             {}
 
 type snapTransporter struct {
 	nopTransporter
-	snapDoneC chan snap.Message
+	snapDoneC chan raftsnap.Message
 	snapDir   string
 }
 
-func NewSnapTransporter(snapDir string) (Transporter, <-chan snap.Message) {
-	ch := make(chan snap.Message, 1)
+func NewSnapTransporter(snapDir string) (Transporter, <-chan raftsnap.Message) {
+	ch := make(chan raftsnap.Message, 1)
 	tr := &snapTransporter{snapDoneC: ch, snapDir: snapDir}
 	return tr, ch
 }
 
-func (s *snapTransporter) SendSnapshot(m snap.Message) {
-	ss := snap.New(s.snapDir)
+func (s *snapTransporter) SendSnapshot(m raftsnap.Message) {
+	ss := raftsnap.New(zap.NewExample(), s.snapDir)
 	ss.SaveDBFrom(m.ReadCloser, m.Snapshot.Metadata.Index+1)
 	m.CloseWithError(nil)
 	s.snapDoneC <- m
